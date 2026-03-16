@@ -1,4 +1,45 @@
 {# vim: ft=rust #}
+{#- ============================================================ -#}
+{#- Macros for DRY decode/encode dispatch across property types   -#}
+{#- ============================================================ -#}
+{%- macro decode_value_expr(val, pathvar, prop, cls, classes) -%}
+{%- if prop.enum_values -%}
+expand_from_context(&decode_string({{ val }}, &{{ pathvar }})?, &{{ const_name(*prop_defining_class(cls, prop, classes).clsname) }}_{{ const_name(prop.varname) }}_CTX)
+{%- elif prop.class_id -%}
+decode_ref({{ val }}, &{{ pathvar }}, &{{ const_name(*prop_defining_class(cls, prop, classes).clsname) }}_{{ const_name(prop.varname) }}_CTX, Some(&{{ const_name(*classes.get(prop.class_id).clsname) }}_TYPE_INFO), state)?
+{%- elif prop.datatype in ["http://www.w3.org/2001/XMLSchema#string", "http://www.w3.org/2001/XMLSchema#anyURI"] -%}
+decode_string({{ val }}, &{{ pathvar }})?
+{%- elif prop.datatype in ["http://www.w3.org/2001/XMLSchema#integer", "http://www.w3.org/2001/XMLSchema#positiveInteger", "http://www.w3.org/2001/XMLSchema#nonNegativeInteger"] -%}
+decode_integer({{ val }}, &{{ pathvar }})?
+{%- elif prop.datatype == "http://www.w3.org/2001/XMLSchema#boolean" -%}
+decode_boolean({{ val }}, &{{ pathvar }})?
+{%- elif prop.datatype == "http://www.w3.org/2001/XMLSchema#decimal" -%}
+decode_float({{ val }}, &{{ pathvar }})?
+{%- elif prop.datatype == "http://www.w3.org/2001/XMLSchema#dateTime" -%}
+decode_datetime({{ val }}, &{{ pathvar }})?
+{%- elif prop.datatype == "http://www.w3.org/2001/XMLSchema#dateTimeStamp" -%}
+decode_datetimestamp({{ val }}, &{{ pathvar }})?
+{%- endif -%}
+{%- endmacro -%}
+
+{%- macro encode_value_expr(val, pathvar, prop, cls, classes) -%}
+{%- if prop.enum_values -%}
+encode_iri({{ val }}, &{{ const_name(*prop_defining_class(cls, prop, classes).clsname) }}_{{ const_name(prop.varname) }}_CTX)
+{%- elif prop.class_id -%}
+encode_ref({{ val }}, &{{ pathvar }}, &{{ const_name(*prop_defining_class(cls, prop, classes).clsname) }}_{{ const_name(prop.varname) }}_CTX, state)?
+{%- elif prop.datatype in ["http://www.w3.org/2001/XMLSchema#string", "http://www.w3.org/2001/XMLSchema#anyURI"] -%}
+encode_string({{ val }})
+{%- elif prop.datatype in ["http://www.w3.org/2001/XMLSchema#integer", "http://www.w3.org/2001/XMLSchema#positiveInteger", "http://www.w3.org/2001/XMLSchema#nonNegativeInteger"] -%}
+encode_integer(*{{ val }})
+{%- elif prop.datatype == "http://www.w3.org/2001/XMLSchema#boolean" -%}
+encode_boolean(*{{ val }})
+{%- elif prop.datatype == "http://www.w3.org/2001/XMLSchema#decimal" -%}
+encode_float(*{{ val }})
+{%- elif prop.datatype in ["http://www.w3.org/2001/XMLSchema#dateTime", "http://www.w3.org/2001/XMLSchema#dateTimeStamp"] -%}
+Value::String(encode_datetime({{ val }}))
+{%- endif -%}
+{%- endmacro -%}
+
 // {{ disclaimer }}
 //
 // SPDX-License-Identifier: {{ spdx_license }}
@@ -198,11 +239,31 @@ fn decode_datetime_string(
 }
 
 fn encode_datetime(dt: &DateTime<FixedOffset>) -> String {
-    if dt.offset().local_minus_utc() == 0 {
+    let offset_secs = dt.offset().local_minus_utc();
+    if offset_secs == 0 {
         dt.format("%Y-%m-%dT%H:%M:%SZ").to_string()
     } else {
-        dt.format("%Y-%m-%dT%H:%M:%S%:z").to_string()
+        let abs_secs = offset_secs.unsigned_abs();
+        let hours = abs_secs / 3600;
+        let minutes = (abs_secs % 3600) / 60;
+        let sign = if offset_secs >= 0 { '+' } else { '-' };
+        format!("{}{}{:02}:{:02}", dt.format("%Y-%m-%dT%H:%M:%S"), sign, hours, minutes)
     }
+}
+
+/// Decode a DateTime string (timezone optional)
+pub fn decode_date_time(s: &str, path: &Path) -> Result<DateTime<FixedOffset>, Error> {
+    decode_datetime_string(s, path, &DATETIME_RE)
+}
+
+/// Decode a DateTimeStamp string (timezone required)
+pub fn decode_date_time_stamp(s: &str, path: &Path) -> Result<DateTime<FixedOffset>, Error> {
+    decode_datetime_string(s, path, &DATETIMESTAMP_RE)
+}
+
+/// Encode a DateTime to string
+pub fn encode_date_time(dt: &DateTime<FixedOffset>) -> String {
+    encode_datetime(dt)
 }
 
 // ============================================================
@@ -503,7 +564,14 @@ fn decode_string(value: &Value, path: &Path) -> Result<String, Error> {
         .ok_or_else(|| Error::Decode(path.to_string(), format!("String expected, got {:?}", value)))
 }
 
-
+fn expand_from_context(s: &str, ctx: &HashMap<String, String>) -> String {
+    for (k, compact_v) in ctx {
+        if s == compact_v {
+            return k.clone();
+        }
+    }
+    s.to_string()
+}
 
 fn decode_boolean(value: &Value, path: &Path) -> Result<bool, Error> {
     value
@@ -887,85 +955,48 @@ impl SHACLObject for {{ struct_name(class) }} {
                     Error::Decode(sub_path.to_string(), "Must be a list".to_string())
                 })?;
                 let mut result = Vec::new();
+      {%- if prop.pattern and prop.datatype in ["http://www.w3.org/2001/XMLSchema#dateTime", "http://www.w3.org/2001/XMLSchema#dateTimeStamp"] %}
+                {
+                    lazy_static! {
+                        static ref DECODE_RE: Regex = Regex::new(r"{{ prop.pattern }}").unwrap();
+                    }
+                    for (idx, v) in arr.iter().enumerate() {
+                        let item_path = sub_path.push_index(idx);
+                        let raw_str = decode_string(v, &item_path)?;
+                        if !DECODE_RE.is_match(&raw_str) {
+                            return Err(Error::Decode(
+                                item_path.to_string(),
+                                format!("Value '{}' does not match pattern '{{ escape_rust_string(prop.pattern) }}'", raw_str),
+                            ));
+                        }
+                        result.push(decode_datetime_string(&raw_str, &item_path, &{% if prop.datatype == "http://www.w3.org/2001/XMLSchema#dateTime" %}DATETIME_RE{% else %}DATETIMESTAMP_RE{% endif %})?);
+                    }
+                }
+      {%- else %}
                 for (idx, v) in arr.iter().enumerate() {
                     let item_path = sub_path.push_index(idx);
-        {%- if prop.enum_values %}
-                    let s = decode_string(v, &item_path)?;
-                    let expanded = {
-                        let ctx = &*{{ const_name(*prop_defining_class(class, prop, classes).clsname) }}_{{ const_name(prop.varname) }}_CTX;
-                        let mut result = s.clone();
-                        for (k, compact_v) in ctx {
-                            if s == *compact_v {
-                                result = k.clone();
-                                break;
-                            }
-                        }
-                        result
-                    };
-                    result.push(expanded);
-        {%- elif prop.class_id %}
-                    let r = decode_ref(v, &item_path, &{{ const_name(*prop_defining_class(class, prop, classes).clsname) }}_{{ const_name(prop.varname) }}_CTX,
-                        Some(&{{ const_name(*classes.get(prop.class_id).clsname) }}_TYPE_INFO), state)?;
-                    result.push(r);
-        {%- elif prop.datatype == "http://www.w3.org/2001/XMLSchema#string" %}
-                    result.push(decode_string(v, &item_path)?);
-        {%- elif prop.datatype == "http://www.w3.org/2001/XMLSchema#anyURI" %}
-                    result.push(decode_string(v, &item_path)?);
-        {%- elif prop.datatype == "http://www.w3.org/2001/XMLSchema#integer" %}
-                    result.push(decode_integer(v, &item_path)?);
-        {%- elif prop.datatype == "http://www.w3.org/2001/XMLSchema#positiveInteger" %}
-                    result.push(decode_integer(v, &item_path)?);
-        {%- elif prop.datatype == "http://www.w3.org/2001/XMLSchema#nonNegativeInteger" %}
-                    result.push(decode_integer(v, &item_path)?);
-        {%- elif prop.datatype == "http://www.w3.org/2001/XMLSchema#boolean" %}
-                    result.push(decode_boolean(v, &item_path)?);
-        {%- elif prop.datatype == "http://www.w3.org/2001/XMLSchema#decimal" %}
-                    result.push(decode_float(v, &item_path)?);
-        {%- elif prop.datatype == "http://www.w3.org/2001/XMLSchema#dateTime" %}
-                    result.push(decode_datetime(v, &item_path)?);
-        {%- elif prop.datatype == "http://www.w3.org/2001/XMLSchema#dateTimeStamp" %}
-                    result.push(decode_datetimestamp(v, &item_path)?);
-        {%- endif %}
+                    result.push({{ decode_value_expr("v", "item_path", prop, class, classes) }});
                 }
+      {%- endif %}
                 self.{{ prop_field_name(prop) }} = result;
     {%- else %}
-        {%- if prop.enum_values %}
-                let s = decode_string(value, &sub_path)?;
-                let expanded = {
-                    let ctx = &*{{ const_name(*prop_defining_class(class, prop, classes).clsname) }}_{{ const_name(prop.varname) }}_CTX;
-                    let mut result = s.clone();
-                    for (k, compact_v) in ctx {
-                        if s == *compact_v {
-                            result = k.clone();
-                            break;
-                        }
+      {%- if prop.pattern and prop.datatype in ["http://www.w3.org/2001/XMLSchema#dateTime", "http://www.w3.org/2001/XMLSchema#dateTimeStamp"] %}
+                {
+                    let raw_str = decode_string(value, &sub_path)?;
+                    lazy_static! {
+                        static ref DECODE_RE: Regex = Regex::new(r"{{ prop.pattern }}").unwrap();
                     }
-                    result
-                };
-                self.{{ prop_field_name(prop) }} = Some(expanded);
-        {%- elif prop.class_id %}
-                let r = decode_ref(value, &sub_path, &{{ const_name(*prop_defining_class(class, prop, classes).clsname) }}_{{ const_name(prop.varname) }}_CTX,
-                    Some(&{{ const_name(*classes.get(prop.class_id).clsname) }}_TYPE_INFO), state)?;
-                self.{{ prop_field_name(prop) }} = Some(r);
-        {%- elif prop.datatype == "http://www.w3.org/2001/XMLSchema#string" %}
-                self.{{ prop_field_name(prop) }} = Some(decode_string(value, &sub_path)?);
-        {%- elif prop.datatype == "http://www.w3.org/2001/XMLSchema#anyURI" %}
-                self.{{ prop_field_name(prop) }} = Some(decode_string(value, &sub_path)?);
-        {%- elif prop.datatype == "http://www.w3.org/2001/XMLSchema#integer" %}
-                self.{{ prop_field_name(prop) }} = Some(decode_integer(value, &sub_path)?);
-        {%- elif prop.datatype == "http://www.w3.org/2001/XMLSchema#positiveInteger" %}
-                self.{{ prop_field_name(prop) }} = Some(decode_integer(value, &sub_path)?);
-        {%- elif prop.datatype == "http://www.w3.org/2001/XMLSchema#nonNegativeInteger" %}
-                self.{{ prop_field_name(prop) }} = Some(decode_integer(value, &sub_path)?);
-        {%- elif prop.datatype == "http://www.w3.org/2001/XMLSchema#boolean" %}
-                self.{{ prop_field_name(prop) }} = Some(decode_boolean(value, &sub_path)?);
-        {%- elif prop.datatype == "http://www.w3.org/2001/XMLSchema#decimal" %}
-                self.{{ prop_field_name(prop) }} = Some(decode_float(value, &sub_path)?);
-        {%- elif prop.datatype == "http://www.w3.org/2001/XMLSchema#dateTime" %}
-                self.{{ prop_field_name(prop) }} = Some(decode_datetime(value, &sub_path)?);
-        {%- elif prop.datatype == "http://www.w3.org/2001/XMLSchema#dateTimeStamp" %}
-                self.{{ prop_field_name(prop) }} = Some(decode_datetimestamp(value, &sub_path)?);
-        {%- endif %}
+                    if !DECODE_RE.is_match(&raw_str) {
+                        return Err(Error::Decode(
+                            sub_path.to_string(),
+                            format!("Value '{}' does not match pattern '{{ escape_rust_string(prop.pattern) }}'", raw_str),
+                        ));
+                    }
+                    self.{{ prop_field_name(prop) }} = Some(decode_datetime_string(&raw_str, &sub_path, &{% if prop.datatype == "http://www.w3.org/2001/XMLSchema#dateTime" %}DATETIME_RE{% else %}DATETIMESTAMP_RE{% endif %})?);
+                }
+      {%- else %}
+                self.{{ prop_field_name(prop) }} = Some({{ decode_value_expr("value", "sub_path", prop, class, classes) }});
+      {%- endif %}
     {%- endif %}
                 Ok(true)
             }
@@ -1041,49 +1072,17 @@ impl SHACLObject for {{ struct_name(class) }} {
             let mut arr = Vec::new();
             for (idx, v) in self.{{ prop_field_name(prop) }}.iter().enumerate() {
                 let _item_path = prop_path.push_index(idx);
-        {%- if prop.enum_values %}
-                let ctx = &{{ const_name(*prop_defining_class(class, prop, classes).clsname) }}_{{ const_name(prop.varname) }}_CTX;
-                arr.push(encode_iri(v, ctx));
-        {%- elif prop.class_id %}
-                let ctx = &{{ const_name(*prop_defining_class(class, prop, classes).clsname) }}_{{ const_name(prop.varname) }}_CTX;
-                arr.push(encode_ref(v, &_item_path, ctx, state)?);
-        {%- elif prop.datatype == "http://www.w3.org/2001/XMLSchema#string" %}
-                arr.push(encode_string(v));
-        {%- elif prop.datatype == "http://www.w3.org/2001/XMLSchema#anyURI" %}
-                arr.push(encode_string(v));
-        {%- elif prop.datatype == "http://www.w3.org/2001/XMLSchema#integer" or prop.datatype == "http://www.w3.org/2001/XMLSchema#positiveInteger" or prop.datatype == "http://www.w3.org/2001/XMLSchema#nonNegativeInteger" %}
-                arr.push(encode_integer(*v));
-        {%- elif prop.datatype == "http://www.w3.org/2001/XMLSchema#boolean" %}
-                arr.push(encode_boolean(*v));
-        {%- elif prop.datatype == "http://www.w3.org/2001/XMLSchema#decimal" %}
-                arr.push(encode_float(*v));
-        {%- elif prop.datatype == "http://www.w3.org/2001/XMLSchema#dateTime" or prop.datatype == "http://www.w3.org/2001/XMLSchema#dateTimeStamp" %}
-                arr.push(Value::String(encode_datetime(v)));
-        {%- endif %}
+                arr.push({{ encode_value_expr("v", "_item_path", prop, class, classes) }});
             }
             data.insert("{{ context.compact_vocab(prop.path) }}".to_string(), Value::Array(arr));
         }
     {%- else %}
         if let Some(v) = &self.{{ prop_field_name(prop) }} {
-        {%- if prop.enum_values %}
-            let ctx = &{{ const_name(*prop_defining_class(class, prop, classes).clsname) }}_{{ const_name(prop.varname) }}_CTX;
-            data.insert("{{ context.compact_vocab(prop.path) }}".to_string(), encode_iri(v, ctx));
-        {%- elif prop.class_id %}
-            let ctx = &{{ const_name(*prop_defining_class(class, prop, classes).clsname) }}_{{ const_name(prop.varname) }}_CTX;
+        {%- if prop.class_id and not prop.enum_values %}
             let prop_path = path.push_path("{{ prop_field_name(prop) }}");
-            data.insert("{{ context.compact_vocab(prop.path) }}".to_string(), encode_ref(v, &prop_path, ctx, state)?);
-        {%- elif prop.datatype == "http://www.w3.org/2001/XMLSchema#string" %}
-            data.insert("{{ context.compact_vocab(prop.path) }}".to_string(), encode_string(v));
-        {%- elif prop.datatype == "http://www.w3.org/2001/XMLSchema#anyURI" %}
-            data.insert("{{ context.compact_vocab(prop.path) }}".to_string(), encode_string(v));
-        {%- elif prop.datatype == "http://www.w3.org/2001/XMLSchema#integer" or prop.datatype == "http://www.w3.org/2001/XMLSchema#positiveInteger" or prop.datatype == "http://www.w3.org/2001/XMLSchema#nonNegativeInteger" %}
-            data.insert("{{ context.compact_vocab(prop.path) }}".to_string(), encode_integer(*v));
-        {%- elif prop.datatype == "http://www.w3.org/2001/XMLSchema#boolean" %}
-            data.insert("{{ context.compact_vocab(prop.path) }}".to_string(), encode_boolean(*v));
-        {%- elif prop.datatype == "http://www.w3.org/2001/XMLSchema#decimal" %}
-            data.insert("{{ context.compact_vocab(prop.path) }}".to_string(), encode_float(*v));
-        {%- elif prop.datatype == "http://www.w3.org/2001/XMLSchema#dateTime" or prop.datatype == "http://www.w3.org/2001/XMLSchema#dateTimeStamp" %}
-            data.insert("{{ context.compact_vocab(prop.path) }}".to_string(), Value::String(encode_datetime(v)));
+            data.insert("{{ context.compact_vocab(prop.path) }}".to_string(), {{ encode_value_expr("v", "prop_path", prop, class, classes) }});
+        {%- else %}
+            data.insert("{{ context.compact_vocab(prop.path) }}".to_string(), {{ encode_value_expr("v", "_unused", prop, class, classes) }});
         {%- endif %}
         }
     {%- endif %}
@@ -1138,7 +1137,19 @@ impl SHACLObject for {{ struct_name(class) }} {
                     _ => {}
                 }
             }
-            NodeKind::BlankNodeOrIRI => {}
+            NodeKind::BlankNodeOrIRI => {
+                if let Some(ref id) = self._id {
+                    if !is_blank_node(id) && !is_iri(id) {
+                        if let Some(ref mut h) = handler {
+                            h.handle_error(
+                                &Error::Validation("@id".to_string(), "ID must be a blank node or IRI".to_string()),
+                                &path.to_string(),
+                            );
+                        }
+                        valid = false;
+                    }
+                }
+            }
         }
 
         // Validate properties

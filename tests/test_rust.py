@@ -7,11 +7,12 @@ import json
 import os
 import subprocess
 import textwrap
+from enum import Enum
 from pathlib import Path
 
 import pytest
 
-from testfixtures import jsonvalidation
+from testfixtures import jsonvalidation, timetests
 
 THIS_FILE = Path(__file__)
 THIS_DIR = THIS_FILE.parent
@@ -23,6 +24,13 @@ TEST_MODEL = THIS_DIR / "data" / "model" / "test.ttl"
 TEST_CONTEXT = THIS_DIR / "data" / "model" / "test-context.json"
 
 SPDX3_CONTEXT_URL = "https://spdx.github.io/spdx-3-model/context.json"
+
+
+class Progress(Enum):
+    COMPILE_FAILS = 0
+    RUN_FAILS = 1
+    VALIDATION_FAILS = 2
+    RUNS = 3
 
 
 def _build_rust_prog(test_lib, tmp_path, name, code):
@@ -85,7 +93,11 @@ def test_lib(tmp_path_factory, model_server):
 
 @pytest.fixture
 def compile_test(test_lib, tmp_path):
-    def f(code_fragment, *, passes=True):
+    def f(code_fragment, *, passes=True, progress=None):
+        # Support both old 'passes' API and new 'progress' API
+        if progress is None:
+            progress = Progress.RUNS if passes else Progress.COMPILE_FAILS
+
         # Create a test binary crate that depends on the generated library
         (tmp_path / "src").mkdir(exist_ok=True)
 
@@ -100,6 +112,7 @@ def compile_test(test_lib, tmp_path):
                 [dependencies]
                 shacl_model = {{ path = "{test_lib}" }}
                 serde_json = "1"
+                chrono = {{ version = "0.4", features = ["serde"] }}
                 """)
         )
 
@@ -109,7 +122,7 @@ def compile_test(test_lib, tmp_path):
                 use shacl_model::*;
                 use std::process;
 
-                fn test_func() -> Result<(), Box<dyn std::error::Error>> {
+                fn test_func() -> Result<(), shacl_model::Error> {
                 """)
             + textwrap.dedent(code_fragment)
             + textwrap.dedent("""\
@@ -121,7 +134,14 @@ def compile_test(test_lib, tmp_path):
                     match test_func() {
                         Ok(()) => process::exit(0),
                         Err(e) => {
-                            eprintln!("ERROR: {}", e);
+                            match &e {
+                                shacl_model::Error::Validation(_, _) => {
+                                    eprintln!("VALIDATION_FAILS {}", e);
+                                }
+                                _ => {
+                                    eprintln!("ERROR {}", e);
+                                }
+                            }
                             process::exit(1);
                         }
                     }
@@ -136,7 +156,7 @@ def compile_test(test_lib, tmp_path):
             encoding="utf-8",
         )
 
-        if not passes:
+        if progress == Progress.COMPILE_FAILS:
             assert p.returncode != 0, (
                 f"Compile succeeded when failure was expected. Output: {p.stdout}"
             )
@@ -153,6 +173,21 @@ def compile_test(test_lib, tmp_path):
             capture_output=True,
             encoding="utf-8",
         )
+
+        if progress == Progress.RUN_FAILS:
+            assert (
+                p.returncode != 0
+            ), f"Run succeeded when failure was expected. Output: {p.stdout}"
+            return None
+
+        if progress == Progress.VALIDATION_FAILS:
+            assert (
+                p.returncode != 0
+            ), f"Run succeeded when validation failure was expected. Output: {p.stdout}"
+            assert (
+                "VALIDATION_FAILS" in p.stderr
+            ), f"VALIDATION_FAILS was not raised in program. stderr: {p.stderr}"
+            return None
 
         assert p.returncode == 0, f"Run failed. stderr: {p.stderr}\nstdout: {p.stdout}"
         return p.stdout
@@ -462,3 +497,222 @@ def test_objset_context(compile_test, context, expanded, compacted):
     output = compile_test("\n".join(program))
 
     assert output.splitlines() == [compacted, expanded]
+
+
+RUST_STRING = '"string".to_string()'
+
+
+@pytest.mark.parametrize(
+    "prop,value,expect",
+    [
+        #
+        # Positive integer
+        ("test_class_positive_integer_prop", "1i64", "1"),
+        ("test_class_positive_integer_prop", "-1i64", Progress.VALIDATION_FAILS),
+        ("test_class_positive_integer_prop", "0i64", Progress.VALIDATION_FAILS),
+        # String value
+        ("test_class_positive_integer_prop", RUST_STRING, Progress.COMPILE_FAILS),
+        #
+        # Non-negative integer
+        ("test_class_nonnegative_integer_prop", "1i64", "1"),
+        ("test_class_nonnegative_integer_prop", "-1i64", Progress.VALIDATION_FAILS),
+        ("test_class_nonnegative_integer_prop", "0i64", "0"),
+        # String value
+        (
+            "test_class_nonnegative_integer_prop",
+            RUST_STRING,
+            Progress.COMPILE_FAILS,
+        ),
+        #
+        # Integer
+        ("test_class_integer_prop", "1i64", "1"),
+        ("test_class_integer_prop", "-1i64", "-1"),
+        ("test_class_integer_prop", "0i64", "0"),
+        # String value
+        ("test_class_integer_prop", RUST_STRING, Progress.COMPILE_FAILS),
+        #
+        # Float
+        ("test_class_float_prop", "-1.0f64", "-1"),
+        ("test_class_float_prop", "0.0f64", "0"),
+        ("test_class_float_prop", "1.0f64", "1"),
+        # String value
+        ("test_class_float_prop", RUST_STRING, Progress.COMPILE_FAILS),
+        #
+        # Boolean prop
+        ("test_class_boolean_prop", "true", "true"),
+        ("test_class_boolean_prop", "false", "false"),
+        # String value
+        ("test_class_boolean_prop", RUST_STRING, Progress.COMPILE_FAILS),
+        #
+        # String Property
+        ("test_class_string_scalar_prop", RUST_STRING, "string"),
+        ("test_class_string_scalar_prop", '"".to_string()', ""),
+        # Integer value
+        ("test_class_string_scalar_prop", "1i64", Progress.COMPILE_FAILS),
+        #
+        # Enumerated value
+        (
+            "test_class_enum_prop",
+            '"http://example.org/enumType/foo".to_string()',
+            "http://example.org/enumType/foo",
+        ),
+        ("test_class_enum_prop", RUST_STRING, Progress.VALIDATION_FAILS),
+        # Integer value
+        ("test_class_enum_prop", "1i64", Progress.COMPILE_FAILS),
+        #
+        # Pattern validated string
+        ("test_class_regex", '"foo1".to_string()', "foo1"),
+        ("test_class_regex", '"foo2".to_string()', "foo2"),
+        ("test_class_regex", '"foo2a".to_string()', "foo2a"),
+        ("test_class_regex", '"bar".to_string()', Progress.VALIDATION_FAILS),
+        ("test_class_regex", '"fooa".to_string()', Progress.VALIDATION_FAILS),
+        ("test_class_regex", '"afoo1".to_string()', Progress.VALIDATION_FAILS),
+        #
+        # ID assignment
+        ("_id", '"_:blank".to_string()', "_:blank"),
+        ("_id", '"http://example.com/test".to_string()', "http://example.com/test"),
+        ("_id", '"not-iri".to_string()', Progress.VALIDATION_FAILS),
+    ],
+)
+def test_scalar_prop_validation(compile_test, prop, value, expect):
+    is_id = prop == "_id"
+
+    if is_id:
+        set_code = f"obj.set_id(Some({value}));"
+    else:
+        set_code = f"obj.{prop} = Some({value});"
+
+    if is_id:
+        print_code = 'println!("{}", obj.id().unwrap());'
+    elif isinstance(expect, Progress):
+        print_code = ""
+    elif isinstance(expect, str):
+        print_code = f'println!("{{}}", obj.{prop}.unwrap());'
+    else:
+        print_code = ""
+
+    validate_code = """\
+        let path = Path::new();
+        if !obj.validate(&path, None) {
+            return Err(Error::Validation("test".to_string(), "Validation failed".to_string()));
+        }
+    """
+
+    output = compile_test(
+        f"""\
+        #[allow(deprecated)]
+        let mut obj = make_test_class();
+        {set_code}
+        {validate_code}
+        {print_code}
+        """,
+        progress=expect if isinstance(expect, Progress) else Progress.RUNS,
+    )
+
+    if isinstance(expect, Progress):
+        assert expect != Progress.RUNS
+    else:
+        expect_lines = [expect]
+        output_lines = output.splitlines()
+        assert (
+            output_lines == expect_lines
+        ), f"Invalid output. Expected {expect_lines!r}, got {output_lines!r}"
+
+
+@timetests.datetime_decode_tests()
+def test_datetime_decode(compile_test, value, expect):
+    output = compile_test(
+        f"""\
+        let path = Path::new();
+        let dt = decode_date_time("{value}", &path)?;
+        println!("{{}}", encode_date_time(&dt));
+        """,
+        progress=Progress.RUN_FAILS if expect is None else Progress.RUNS,
+    )
+
+    if expect is not None:
+        if expect.utcoffset():
+            s = expect.isoformat()
+        else:
+            s = expect.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+        assert (
+            output.rstrip() == s
+        ), f"Test failed. Expected {s!r}, got {output.rstrip()!r}"
+
+
+@timetests.datetimestamp_decode_tests()
+def test_datetimestamp_decode(compile_test, value, expect):
+    output = compile_test(
+        f"""\
+        let path = Path::new();
+        let dt = decode_date_time_stamp("{value}", &path)?;
+        println!("{{}}", encode_date_time(&dt));
+        """,
+        progress=Progress.RUN_FAILS if expect is None else Progress.RUNS,
+    )
+
+    if expect is not None:
+        if expect.utcoffset():
+            s = expect.isoformat()
+        else:
+            s = expect.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+        assert (
+            output.rstrip() == s
+        ), f"Test failed. Expected {s!r}, got {output.rstrip()!r}"
+
+
+@timetests.datetime_encode_tests()
+def test_datetime_encode(compile_test, value, expect):
+    offset_secs = int(value.utcoffset().total_seconds())
+    output = compile_test(
+        f"""\
+        use chrono::{{FixedOffset, TimeZone}};
+        let offset = FixedOffset::east_opt({offset_secs}).unwrap();
+        let dt = offset.with_ymd_and_hms({value.year}, {value.month}, {value.day}, {value.hour}, {value.minute}, {value.second}).unwrap();
+        println!("{{}}", encode_date_time(&dt));
+        """,
+        progress=Progress.RUN_FAILS if expect is None else Progress.RUNS,
+    )
+
+    if expect is not None:
+        assert (
+            output.rstrip() == expect
+        ), f"Test failed. Expected {expect!r}, got {output.rstrip()!r}"
+
+
+def test_extensible_context(compile_test, roundtrip):
+    compile_test(
+        f"""\
+        use std::fs::File;
+        use std::io::BufReader;
+
+        let file = File::open("{roundtrip}")?;
+        let reader = BufReader::new(file);
+
+        let mut objset = SHACLObjectSet::new();
+        objset.decode(reader)?;
+
+        let obj = objset.get_object_by_id("http://serialize.example.com/test-uses-extensible-abstract")
+            .expect("Unable to find object");
+
+        let abstract_obj = obj.downcast_ref::<UsesExtensibleAbstractClass>()
+            .expect("Object is not of expected type");
+
+        let prop_ref = abstract_obj.uses_extensible_abstract_class_prop.as_ref()
+            .expect("Property not set");
+
+        let prop_obj = prop_ref.get_object()
+            .expect("Property is not an object ref");
+
+        let inner = prop_obj.as_shacl_object();
+        assert_eq!(inner.type_iri(), "http://serialize.example.com/custom-extensible",
+            "Wrong type: {{}}", inner.type_iri());
+
+        let ext_props = inner.get_ext_properties()
+            .expect("No extension properties");
+        assert!(ext_props.contains_key("http://custom-prop.example.com/prop"),
+            "Missing extension property");
+        """,
+    )
